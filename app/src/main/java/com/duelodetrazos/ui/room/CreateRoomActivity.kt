@@ -2,11 +2,12 @@ package com.duelodetrazos.ui.room
 
 import android.content.Intent
 import android.os.Bundle
-import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.duelodetrazos.PlayerManager
 import com.duelodetrazos.databinding.ActivityCreateRoomBinding
 import com.duelodetrazos.ui.game.GameActivity
+import com.google.android.material.snackbar.Snackbar
+import com.parse.ParseException
 import com.parse.ParseObject
 import com.parse.SaveCallback
 import kotlin.random.Random
@@ -24,11 +25,10 @@ class CreateRoomActivity : AppCompatActivity() {
         binding.btnGenerate.setOnClickListener {
             val playerName = binding.edtPlayerName.text.toString().trim()
             if (playerName.isEmpty()) {
-                Toast.makeText(this, "Por favor, introduce tu nombre", Toast.LENGTH_SHORT).show()
+                Snackbar.make(binding.root, "Por favor, introduce tu nombre", Snackbar.LENGTH_SHORT).show()
                 return@setOnClickListener
             }
 
-            // Desactivar el boton para evitar la creacion de multiples salas.
             binding.btnGenerate.isEnabled = false
             val code = generateRoomCode()
             binding.txtRoomCode.text = code
@@ -38,20 +38,17 @@ class CreateRoomActivity : AppCompatActivity() {
         }
     }
 
-    // Genera un codigo de sala alfanumerico de 4 caracteres (ej. AB12).
     private fun generateRoomCode(): String {
         val letters = ('A'..'Z').random().toString() + ('A'..'Z').random()
         val numbers = Random.nextInt(10, 99).toString()
         return letters + numbers
     }
 
-    // Guarda la nueva sala en el servidor de Back4App con los datos iniciales.
     private fun saveRoomToServer(code: String, player1Id: String, player1Name: String) {
         val room = ParseObject("Room")
 
-        // Configuracion inicial de la sala.
         room.put("code", code)
-        room.put("status", "waiting") // 'waiting' para que otros jugadores puedan unirse.
+        room.put("status", "waiting")
         room.put("player1Id", player1Id)
         room.put("player1Name", player1Name)
         room.put("player2Id", "")
@@ -61,8 +58,7 @@ class CreateRoomActivity : AppCompatActivity() {
 
         room.saveInBackground(SaveCallback { e ->
             if (e == null) {
-                // Si la sala se crea con exito, iniciar la actividad del juego.
-                Toast.makeText(this, "Sala creada. Esperando al segundo jugador!", Toast.LENGTH_LONG).show()
+                Snackbar.make(binding.root, "Sala creada. Esperando al segundo jugador!", Snackbar.LENGTH_LONG).show()
 
                 val intent = Intent(this, GameActivity::class.java).apply {
                     putExtra("roomId", code)
@@ -70,11 +66,15 @@ class CreateRoomActivity : AppCompatActivity() {
                     putExtra("player1Name", player1Name)
                 }
                 startActivity(intent)
-                finish() // Cerrar esta actividad para que el usuario no pueda volver.
+                finish()
 
             } else {
-                // Si hay un error, notificar al usuario y reactivar el boton.
-                Toast.makeText(this, "Error al crear la sala: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                val errorMessage = if (e.code == ParseException.CONNECTION_FAILED) {
+                    "Error de conexion. Verifica tu red."
+                } else {
+                    "Error al crear la sala: ${e.localizedMessage}"
+                }
+                Snackbar.make(binding.root, errorMessage, Snackbar.LENGTH_LONG).show()
                 binding.btnGenerate.isEnabled = true
             }
         })

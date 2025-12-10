@@ -7,6 +7,20 @@
     android:background="#1A1A1A"
     tools:context=".ui.game.GameActivity">
 
+    <!-- Barra de estado de conexion -->
+    <TextView
+        android:id="@+id/tvConnectionStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:background="#C62828"
+        android:gravity="center"
+        android:padding="4dp"
+        android:text="Conexion perdida. Intentando reconectar..."
+        android:textColor="#FFFFFF"
+        android:visibility="gone"
+        app:layout_constraintTop_toTopOf="parent"
+        tools:visibility="visible" />
+
     <!-- Contenedor para la informacion de la partida -->
     <LinearLayout
         android:id="@+id/layout_game_info"
@@ -14,7 +28,7 @@
         android:layout_height="wrap_content"
         android:orientation="horizontal"
         android:padding="16dp"
-        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/tvConnectionStatus"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent">
 

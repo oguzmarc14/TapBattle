@@ -1,6 +1,10 @@
 package com.duelodetrazos.ui.game
 
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.net.ConnectivityManager
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -13,59 +17,56 @@ import com.duelodetrazos.databinding.ActivityGameBinding
 import com.duelodetrazos.network.LiveQueryManager
 import com.duelodetrazos.ui.canvas.DrawingView
 import com.duelodetrazos.ui.room.RoomActivity
+import com.google.android.material.snackbar.Snackbar
+import com.parse.ParseException
 import com.parse.ParseObject
 import com.parse.ParseQuery
 import org.json.JSONObject
 import java.util.UUID
 import kotlin.random.Random
 
-// GameActivity es la pantalla principal donde se desarrolla la partida.
 class GameActivity : AppCompatActivity() {
 
     companion object {
-        // Intervalo para las consultas de sondeo (polling) al servidor.
         private const val POLLING_INTERVAL_MS = 100L
-        // Retraso para la aparicion de un nuevo objetivo despues de un acierto.
         private const val SPAWN_DELAY_MS = 500L
+        private const val CONNECTION_TIMEOUT_MS = 15000L // 15 segundos
     }
 
     private lateinit var binding: ActivityGameBinding
-
-    // Vistas personalizadas para el juego.
     private lateinit var drawingView: DrawingView
     private lateinit var objectiveView: ObjectiveCircleView
     private lateinit var explosionView: ParticleExplosionView
 
-    // -- DATOS DE LA PARTIDA --
     private var roomId: String = ""
     private var isPlayer1 = false
     private var player1Name: String = "Jugador 1"
     private var player2Name: String = "Jugador 2"
 
-    // -- ESTADO DEL JUEGO --
     private var currentObjectiveId: String? = null
     @Volatile private var isLocalHitSent = false
     private var player1Score = 0
     private var player2Score = 0
     @Volatile private var isGameRunning = true
     @Volatile private var isGamePaused = false
+    @Volatile private var wasPausedByNetwork = false // Flag para gestionar pausas por red
 
-    // -- MANEJO DE EVENTOS Y SONDEO (POLLING) --
     private val eventPollingHandler = Handler(Looper.getMainLooper())
     private var spawnPollingRunnable: Runnable? = null
     private var hitRequestPollingRunnable: Runnable? = null
     private var scoreUpdatePollingRunnable: Runnable? = null
     private var player2JoinedPollingRunnable: Runnable? = null
-    private var gameStatePollingRunnable: Runnable? = null // Para Pausa, Reanudar, Abandonar
+    private var gameStatePollingRunnable: Runnable? = null
 
-    // IDs de los ultimos eventos vistos para evitar procesarlos multiples veces.
     private var lastSeenSpawnId: String? = null
     private var lastSeenHitRequestId: String? = null
     private var lastSeenScoreUpdateId: String? = null
     private var lastSeenGameStateId: String? = null
 
-    // Almacena los IDs de objetivos que ya han sido puntuados para evitar dobles puntos.
     private val scoredObjectiveIds = mutableSetOf<String>()
+    private lateinit var connectivityReceiver: ConnectivityReceiver
+    private val disconnectHandler = Handler(Looper.getMainLooper())
+    private var disconnectRunnable: Runnable? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -82,9 +83,11 @@ class GameActivity : AppCompatActivity() {
         updateScoreDisplay()
         startGameWhenReady()
         setupButtons()
+
+        connectivityReceiver = ConnectivityReceiver()
+        registerReceiver(connectivityReceiver, IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION))
     }
 
-    // Extrae los datos necesarios (ID de sala, nombres, etc.) del Intent.
     private fun getIntentData(): Boolean {
         roomId = intent.getStringExtra("roomId") ?: ""
         isPlayer1 = intent.getBooleanExtra("isPlayer1", false)
@@ -97,7 +100,6 @@ class GameActivity : AppCompatActivity() {
         return true
     }
 
-    // Inicializa las vistas personalizadas y las anade al contenedor principal.
     private fun setupViews() {
         drawingView = DrawingView(this)
         binding.containerCanvas.addView(drawingView)
@@ -108,20 +110,17 @@ class GameActivity : AppCompatActivity() {
         objectiveView.onHit = { registerHitRequest() }
     }
 
-    // Configura la informacion inicial en la interfaz de usuario.
     private fun setupGameInfo() {
         binding.tvRoomCode.text = roomId
         binding.tvPlayer1Name.text = player1Name
         binding.tvPlayer2Name.text = if (isPlayer1 && player2Name == "Jugador 2") "(Esperando...)" else player2Name
     }
 
-    // Actualiza los marcadores en la pantalla.
     private fun updateScoreDisplay() {
         binding.tvPlayer1Score.text = player1Score.toString()
         binding.tvPlayer2Score.text = player2Score.toString()
     }
 
-    // Espera a que el layout este listo para obtener las dimensiones y luego inicia el juego.
     private fun startGameWhenReady() {
         binding.containerCanvas.viewTreeObserver.addOnGlobalLayoutListener(object : ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
@@ -140,7 +139,6 @@ class GameActivity : AppCompatActivity() {
         })
     }
 
-    // Inicia un sondeo para detectar cambios de estado globales (Pausa, Reanudar, Abandono).
     private fun startPollingForGameStateChanges() {
         gameStatePollingRunnable = Runnable {
             val query = ParseQuery.getQuery<ParseObject>("GameEvent").whereEqualTo("roomCode", roomId).whereNotEqualTo("type", "SPAWN").whereNotEqualTo("type", "HIT_REQUEST").whereNotEqualTo("type", "SCORE_UPDATE").orderByDescending("createdAt")
@@ -148,38 +146,52 @@ class GameActivity : AppCompatActivity() {
                 if (e == null && obj != null && obj.objectId != lastSeenGameStateId) {
                     lastSeenGameStateId = obj.objectId
                     when (obj.getString("type")) {
-                        "PAUSE" -> handlePause(true)
-                        "RESUME" -> handlePause(false)
+                        "PAUSE" -> handlePause(true, isNetworkInduced = false)
+                        "RESUME" -> handlePause(false, isNetworkInduced = false)
                         "ABANDON" -> handleAbandon(obj.getJSONObject("payload")?.getString("abandoningPlayer"))
                     }
-                }
+                } 
                 if (isGameRunning) gameStatePollingRunnable?.let { eventPollingHandler.postDelayed(it, POLLING_INTERVAL_MS) }
             }
         }
         gameStatePollingRunnable?.let { eventPollingHandler.post(it) }
     }
 
-    // Gestiona la logica de UI para pausar o reanudar el juego.
-    private fun handlePause(isPaused: Boolean) {
+    private fun handlePause(isPaused: Boolean, isNetworkInduced: Boolean) {
         this.isGamePaused = isPaused
+        if(isNetworkInduced) {
+            wasPausedByNetwork = isPaused
+        }
+
         runOnUiThread {
-            binding.pauseOverlay.visibility = if (isPaused) View.VISIBLE else View.GONE
+            if (isPaused) {
+                if(isNetworkInduced){
+                    binding.tvConnectionStatus.visibility = View.VISIBLE
+                    binding.pauseOverlay.visibility = View.GONE
+                } else {
+                    binding.tvConnectionStatus.visibility = View.GONE
+                    binding.pauseOverlay.visibility = View.VISIBLE
+                }
+            } else {
+                binding.tvConnectionStatus.visibility = View.GONE
+                binding.pauseOverlay.visibility = View.GONE
+            }
             objectiveView.visibility = if (isPaused) View.INVISIBLE else View.VISIBLE
         }
     }
 
-    // Gestiona el evento de abandono de un jugador.
     private fun handleAbandon(abandoningPlayer: String?) {
         if (!isGameRunning) return
 
-        val winner = if (abandoningPlayer == "player1") player2Name else player1Name
-        val loser = if (abandoningPlayer == "player1") player1Name else player2Name
-        val winnerText = "$loser ha abandonado. $winner Gana!"
+        val (winnerText, winnerName) = if (abandoningPlayer == "player1") {
+            Pair("$player1Name ha abandonado. $player2Name Gana!", player2Name)
+        } else {
+            Pair("$player2Name ha abandonado. $player1Name Gana!", player1Name)
+        }
 
-        endGame(winnerText, winner)
+        endGame(winnerText, winnerName)
     }
 
-    // El jugador 1 espera a que el jugador 2 se una para obtener su nombre y empezar la partida.
     private fun pollForPlayer2Join() {
         player2JoinedPollingRunnable = Runnable {
             val query = ParseQuery.getQuery<ParseObject>("Room").whereEqualTo("code", roomId)
@@ -192,7 +204,7 @@ class GameActivity : AppCompatActivity() {
                     }
                     startPollingForHitRequests()
                     spawnNewObjective()
-                } else if (isGameRunning) {
+                } else if (e == null && isGameRunning) {
                     player2JoinedPollingRunnable?.let { eventPollingHandler.postDelayed(it, 2000) }
                 }
             }
@@ -200,7 +212,6 @@ class GameActivity : AppCompatActivity() {
         player2JoinedPollingRunnable?.let { eventPollingHandler.post(it) }
     }
 
-    // El jugador 2 escucha la aparicion de nuevos objetivos creados por el jugador 1.
     private fun startPollingForSpawns() {
         spawnPollingRunnable = Runnable {
             if (!isGameRunning || isGamePaused) {
@@ -222,7 +233,6 @@ class GameActivity : AppCompatActivity() {
         spawnPollingRunnable?.let { eventPollingHandler.post(it) }
     }
 
-    // El jugador 1 (juez) escucha las peticiones de acierto de ambos jugadores.
     private fun startPollingForHitRequests() {
         hitRequestPollingRunnable = Runnable {
             if (!isGameRunning || isGamePaused) {
@@ -235,12 +245,10 @@ class GameActivity : AppCompatActivity() {
                     lastSeenHitRequestId = obj.objectId
                     val payload = obj.getJSONObject("payload")!!
                     val objectiveId = payload.getString("objectiveId")
-
                     if (!scoredObjectiveIds.contains(objectiveId)) {
                         scoredObjectiveIds.add(objectiveId)
                         val scoringPlayer = payload.getString("playerId")
                         if (scoringPlayer == "player1") player1Score++ else player2Score++
-
                         val confirmationData = JSONObject().apply {
                             put("p1Score", player1Score)
                             put("p2Score", player2Score)
@@ -254,7 +262,6 @@ class GameActivity : AppCompatActivity() {
         hitRequestPollingRunnable?.let { eventPollingHandler.post(it) }
     }
 
-    // Ambos jugadores escuchan las actualizaciones de puntuacion enviadas por el juez.
     private fun startPollingForScoreUpdates() {
         scoreUpdatePollingRunnable = Runnable {
             if (!isGameRunning) return@Runnable
@@ -263,22 +270,18 @@ class GameActivity : AppCompatActivity() {
                 if (e == null && obj != null && obj.objectId != lastSeenScoreUpdateId) {
                     lastSeenScoreUpdateId = obj.objectId
                     val payload = obj.getJSONObject("payload")!!
-
                     if (isGameRunning) {
                         player1Score = payload.getInt("p1Score")
                         player2Score = payload.getInt("p2Score")
                         updateScoreDisplay()
-
                         if (isGameRunning && ((player1Score == 9 && player2Score < 9) || (player2Score == 9 && player1Score < 9))) {
                             val matchPointPlayer = if (player1Score == 9) player1Name else player2Name
                             Toast.makeText(this, "Punto de partido para $matchPointPlayer!", Toast.LENGTH_LONG).show()
                         }
-
                         val hitX = objectiveView.getCircleX()
                         val hitY = objectiveView.getCircleY()
                         objectiveView.setPosition(-200f, -200f)
                         explosionView.startExplosion(hitX, hitY, objectiveView.getCircleColor())
-
                         if (player1Score >= 10 || player2Score >= 10) {
                             endGame()
                         } else {
@@ -294,11 +297,9 @@ class GameActivity : AppCompatActivity() {
         scoreUpdatePollingRunnable?.let { eventPollingHandler.post(it) }
     }
 
-    // Finaliza el juego, muestra el resultado y guarda la partida.
     private fun endGame(winnerText: String, winnerName: String) {
         if (!isGameRunning) return
         isGameRunning = false
-
         runOnUiThread {
             binding.tvGameOver.text = winnerText
             binding.tvGameOver.visibility = View.VISIBLE
@@ -307,15 +308,12 @@ class GameActivity : AppCompatActivity() {
             drawingView.onTouchPoint = { _, _ -> }
             objectiveView.visibility = View.GONE
         }
-
-        // Solo el juez (P1) guarda el resultado para evitar duplicados.
         if (isPlayer1) {
             saveMatchResult(winnerName)
         }
         stopAllPolling()
     }
-    
-    // Sobrecarga de endGame para manejar la victoria por puntuacion.
+
     private fun endGame() {
         if (player1Score >= 10 || player2Score >= 10) {
             val winner = if (player1Score >= 10) player1Name else player2Name
@@ -323,7 +321,6 @@ class GameActivity : AppCompatActivity() {
         }
     }
 
-    // Guarda el objeto MatchResult en el servidor de Back4App.
     private fun saveMatchResult(winnerName: String) {
         val matchResult = ParseObject("MatchResult").apply {
             put("player1Name", player1Name)
@@ -335,23 +332,17 @@ class GameActivity : AppCompatActivity() {
         matchResult.saveInBackground()
     }
 
-    // Crea un nuevo objetivo en una posicion aleatoria y lo notifica.
     private fun spawnNewObjective() {
         if (!isGameRunning || isGamePaused) return
-
         val width = binding.containerCanvas.width
         val height = binding.containerCanvas.height
         if (width == 0 || height == 0) return
-
         val newObjectiveId = UUID.randomUUID().toString()
         currentObjectiveId = newObjectiveId
         isLocalHitSent = false
-
         val x = Random.nextInt((width * 0.2f).toInt(), (width * 0.8f).toInt()).toFloat()
         val y = Random.nextInt((height * 0.2f).toInt(), (height * 0.8f).toInt()).toFloat()
-
         objectiveView.setPosition(x, y)
-
         val data = JSONObject().apply {
             put("x", x)
             put("y", y)
@@ -360,11 +351,9 @@ class GameActivity : AppCompatActivity() {
         LiveQueryManager.sendEvent(roomId, "SPAWN", data)
     }
 
-    // Envia una peticion de acierto al servidor cuando el jugador toca el objetivo.
     private fun registerHitRequest() {
         if (isLocalHitSent || currentObjectiveId == null || !isGameRunning || isGamePaused) return
         isLocalHitSent = true
-
         val playerId = if (isPlayer1) "player1" else "player2"
         val data = JSONObject().apply {
             put("playerId", playerId)
@@ -373,22 +362,21 @@ class GameActivity : AppCompatActivity() {
         LiveQueryManager.sendEvent(roomId, "HIT_REQUEST", data)
     }
 
-    // Configura los listeners para todos los botones de la actividad.
     private fun setupButtons() {
         binding.btnPause.setOnClickListener {
-            if(isGameRunning && !isGamePaused) {
-                handlePause(true)
+            if (isGameRunning && !isGamePaused) {
+                handlePause(true, isNetworkInduced = false)
                 LiveQueryManager.sendEvent(roomId, "PAUSE", JSONObject())
             }
         }
         binding.btnResume.setOnClickListener {
-            if(isGameRunning && isGamePaused) {
-                handlePause(false)
+            if (isGameRunning && isGamePaused && !wasPausedByNetwork) {
+                handlePause(false, isNetworkInduced = false)
                 LiveQueryManager.sendEvent(roomId, "RESUME", JSONObject())
             }
         }
         binding.btnAbandon.setOnClickListener {
-            if(isGameRunning) {
+            if (isGameRunning) {
                 showAbandonConfirmationDialog()
             }
         }
@@ -400,38 +388,77 @@ class GameActivity : AppCompatActivity() {
         }
     }
 
-    // Muestra un dialogo de confirmacion antes de abandonar la partida.
     private fun showAbandonConfirmationDialog() {
         AlertDialog.Builder(this)
             .setTitle("Abandonar Partida")
             .setMessage("Estas seguro de que quieres abandonar? Tu oponente ganara la partida.")
             .setPositiveButton("Si, abandonar") { _, _ ->
-                val data = JSONObject().apply {
-                    put("abandoningPlayer", if (isPlayer1) "player1" else "player2")
-                }
-                LiveQueryManager.sendEvent(roomId, "ABANDON", data)
+                forceAbandon()
             }
             .setNegativeButton("No", null)
             .show()
     }
 
-    // Detiene todos los bucles de sondeo activos.
+    private fun forceAbandon() {
+        if (!isGameRunning) return
+        val data = JSONObject().apply {
+            put("abandoningPlayer", if (isPlayer1) "player1" else "player2")
+        }
+        LiveQueryManager.sendEvent(roomId, "ABANDON", data)
+        handleAbandon(if (isPlayer1) "player1" else "player2")
+    }
+
     private fun stopAllPolling() {
         spawnPollingRunnable?.let { eventPollingHandler.removeCallbacks(it) }
         hitRequestPollingRunnable?.let { eventPollingHandler.removeCallbacks(it) }
         scoreUpdatePollingRunnable?.let { eventPollingHandler.removeCallbacks(it) }
         player2JoinedPollingRunnable?.let { eventPollingHandler.removeCallbacks(it) }
         gameStatePollingRunnable?.let { eventPollingHandler.removeCallbacks(it) }
+        disconnectHandler.removeCallbacksAndMessages(null)
     }
 
-    // Limpieza final al destruir la actividad.
+    inner class ConnectivityReceiver : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (!isNetworkConnected()) {
+                if (isGameRunning && !isGamePaused) {
+                    handlePause(true, isNetworkInduced = true)
+                    disconnectRunnable = Runnable { forceAbandonAfterDisconnect() }
+                    disconnectHandler.postDelayed(disconnectRunnable!!, CONNECTION_TIMEOUT_MS)
+                }
+            } else {
+                disconnectHandler.removeCallbacks(disconnectRunnable ?: return@onReceive)
+                if (wasPausedByNetwork) {
+                    handlePause(false, isNetworkInduced = true)
+                }
+            }
+        }
+    }
+
+    private fun forceAbandonAfterDisconnect() {
+        if (!isNetworkConnected()) {
+            runOnUiThread { Toast.makeText(this, "Has sido desconectado por inactividad.", Toast.LENGTH_LONG).show() }
+            forceAbandon()
+        }
+    }
+
+    private fun isNetworkConnected(): Boolean {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        return cm.activeNetworkInfo?.isConnectedOrConnecting == true
+    }
+
+    override fun onStop() {
+        super.onStop()
+        if (isGameRunning && !isGamePaused) {
+            handlePause(true, isNetworkInduced = false)
+            LiveQueryManager.sendEvent(roomId, "PAUSE", JSONObject())
+        }
+    }
+
     override fun onDestroy() {
         super.onDestroy()
+        unregisterReceiver(connectivityReceiver)
         if (isGameRunning) {
-            val data = JSONObject().apply {
-                put("abandoningPlayer", if (isPlayer1) "player1" else "player2")
-            }
-            LiveQueryManager.sendEvent(roomId, "ABANDON", data)
+            forceAbandon()
         }
         isGameRunning = false
         stopAllPolling()
