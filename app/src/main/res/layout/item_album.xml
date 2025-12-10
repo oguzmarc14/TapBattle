@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<com.google.android.material.card.MaterialCardView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="230dp"
+    android:layout_margin="12dp"
+    android:backgroundTint="#1A1A1A"
+    app:cardCornerRadius="20dp"
+    app:cardElevation="4dp">
+
+    <RelativeLayout
+        android:layout_width="match_parent"
+        android:layout_height="match_parent">
+
+        <!-- Imagen estilo portada -->
+        <ImageView
+            android:id="@+id/imgAlbum"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:scaleType="centerCrop"
+            android:adjustViewBounds="true"
+            android:background="@drawable/bg_album_rounded" />
+
+        <!-- Oscurecedor para contraste -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:background="#66000000" />
+
+        <!-- Titulo -->
+        <TextView
+            android:id="@+id/txtAlbumTitle"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Titulo"
+            android:textColor="#FFFFFF"
+            android:textSize="22sp"
+            android:textStyle="bold"
+            android:layout_alignParentBottom="true"
+            android:layout_margin="14dp" />
+
+    </RelativeLayout>
+</com.google.android.material.card.MaterialCardView>
